@@ -160,16 +160,62 @@ class MessageHandler:
             command = json.loads(body)
             logger.info(f"Received command: {command}")
 
+            # Handle mode changes first
+            if "mode" in command:
+                mode = command["mode"].upper()
+                logger.info(f"Setting operation mode to {mode}")
+                
+                if mode == "AUTOMATIC":
+                    if self.state_manager.set_automatic_mode(True):
+                        logger.info("Successfully switched to AUTOMATIC mode - soil sensor will control pump")
+                    else:
+                        logger.error("Failed to switch to AUTOMATIC mode")
+                elif mode == "MANUAL":
+                    if self.state_manager.set_automatic_mode(False):
+                        logger.info("Successfully switched to MANUAL mode - soil sensor readings will be ignored")
+                    else:
+                        logger.error("Failed to switch to MANUAL mode")
+                        
+                # Always send status update after mode change
+                self.send_status_update()
+
+            # Handle pump control commands
             if "pump_control" in command:
                 state = command["pump_control"] == "ON"
+                logger.info(f"Processing pump control command: {'ON' if state else 'OFF'}")
+                
+                # If turning pump ON and force_manual_mode flag is set, switch to manual mode first
+                if state and command.get("force_manual_mode", False):
+                    logger.info("Auto-switching to MANUAL mode due to force_manual_mode flag")
+                    if self.state_manager.set_automatic_mode(False):
+                        logger.info("Successfully switched to MANUAL mode")
+                    else:
+                        logger.error("Failed to switch to MANUAL mode")
+                
                 if self.pump_controller.force_pump_state(state):
                     self.state_manager.update_pump_state(state)
+                    logger.info(f"Pump turned {'ON' if state else 'OFF'} successfully in current mode")
                     self.send_status_update()
+                else:
+                    logger.error(f"Failed to set pump to {'ON' if state else 'OFF'}")
             elif "state" in command:
                 state = bool(command["state"])
+                logger.info(f"Setting pump state to {'ON' if state else 'OFF'}")
+                
+                # If turning pump ON and force_manual_mode flag is set, switch to manual mode first
+                if state and command.get("force_manual_mode", False):
+                    logger.info("Auto-switching to MANUAL mode due to force_manual_mode flag")
+                    if self.state_manager.set_automatic_mode(False):
+                        logger.info("Successfully switched to MANUAL mode")
+                    else:
+                        logger.error("Failed to switch to MANUAL mode")
+                
                 if self.pump_controller.force_pump_state(state):
                     self.state_manager.update_pump_state(state)
+                    logger.info(f"Pump turned {'ON' if state else 'OFF'} successfully")
                     self.send_status_update()
+                else:
+                    logger.error(f"Failed to set pump to {'ON' if state else 'OFF'}")
 
             self.acknowledge_message(delivery_tag)
         except json.JSONDecodeError as e:

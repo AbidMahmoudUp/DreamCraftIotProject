@@ -15,6 +15,7 @@ class SystemState:
     last_watering: Optional[float] = None
     last_check: Optional[float] = None
     mode: str = "auto"  # "auto" or "manual"
+    mode_set_by_user: bool = False  # Track if mode was explicitly set by user command
     error: Optional[str] = None
     last_update: Optional[float] = None
 
@@ -94,7 +95,7 @@ class StateManager:
             logger.error(f"Invalid mode: {mode}")
             return False
             
-        return self.update_state(mode=mode)
+        return self.update_state(mode=mode, mode_set_by_user=True)
         
     def update_sensor_data(self, soil_moist: bool, temperature: float, humidity: float) -> None:
         """
@@ -131,3 +132,50 @@ class StateManager:
             
         time_since_last = time.time() - self._state.last_watering
         return time_since_last >= min_interval 
+        
+    def set_automatic_mode(self, automatic: bool) -> bool:
+        """
+        Set the system to automatic or manual mode.
+        Args:
+            automatic: True for automatic mode, False for manual mode
+        Returns:
+            bool: True if mode was set successfully
+        """
+        mode = "auto" if automatic else "manual"
+        result = self.set_mode(mode)
+        if result:
+            logger.info(f"System set to {'AUTOMATIC' if automatic else 'MANUAL'} mode")
+        return result
+        
+    def update_pump_state(self, pump_on: bool) -> bool:
+        """
+        Update the pump state.
+        Args:
+            pump_on: True to turn pump on, False to turn pump off
+        Returns:
+            bool: True if pump state was updated successfully
+        """
+        result = self.update_state(pump_on=pump_on)
+        if result:
+            logger.info(f"Pump state set to {'ON' if pump_on else 'OFF'}")
+            if pump_on:
+                # Record watering start time if turning on
+                self.update_state(last_watering=time.time())
+        return result
+        
+    def get_status_message(self) -> Dict[str, Any]:
+        """
+        Get a formatted status message for sending via messaging system.
+        Returns:
+            Dict[str, Any]: Status information
+        """
+        state = self.get_state()
+        return {
+            "rpi_id": "irrigation_system_1",  # Should be from config
+            "timestamp": time.time(),
+            "soil_is_dry": not state.get("soil_moist", False),
+            "pump_active": state.get("pump_on", False),
+            "automatic_mode": state.get("mode", "auto") == "auto",
+            "last_watered": state.get("last_watering"),
+            "temperature": state.get("temperature")
+        } 
