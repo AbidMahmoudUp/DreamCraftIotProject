@@ -12,6 +12,10 @@ class SystemState:
     soil_moist: bool = False
     temperature: float = 0.0
     humidity: float = 0.0
+    light_detected: bool = False  # Store LDR reading
+    ventilator_on: bool = False  # Ventilator current state
+    ventilator_auto: bool = True  # Ventilator mode (auto/manual)
+    ventilator_cycling: bool = False  # Whether ventilator is in cycling mode
     last_watering: Optional[float] = None
     last_check: Optional[float] = None
     mode: str = "auto"  # "auto" or "manual"
@@ -177,5 +181,9 @@ class StateManager:
             "pump_active": state.get("pump_on", False),
             "automatic_mode": state.get("mode", "auto") == "auto",
             "last_watered": state.get("last_watering"),
-            "temperature": state.get("temperature")
+            "temperature": state.get("temperature"),
+            "light_detected": state.get("light_detected", False),  # Include light sensor data
+            "ventilator_on": state.get("ventilator_on", False),  # Include ventilator state
+            "ventilator_auto": state.get("ventilator_auto", True),  # Include ventilator mode
+            "ventilator_cycling": state.get("ventilator_cycling", False)  # Include ventilator cycling state
         } 

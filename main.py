@@ -29,15 +29,30 @@ class SmartIrrigationSystem:
         logger.info(f"Using pins - Soil: {SOIL_SENSOR_PIN}, Pump: {PUMP_PIN}, DHT: {DHT_PIN}")
         
         # Initialize DHT sensor with explicit pin from settings
+        logger.info("Initializing DHT sensor with board.D20 (GPIO20)")
         self.dht_sensor = DHTSensor(board.D20)  # Using D20 for DHT sensor
+        
+        # Give the DHT sensor time to initialize fully
+        time.sleep(2)
+        
+        # Try to get an initial reading to verify the sensor is working
+        temp, humidity = self.dht_sensor.read()
+        if temp is not None and humidity is not None:
+            logger.info(f"Initial DHT reading successful: {temp:.1f}°C, {humidity:.1f}%")
+        else:
+            logger.warning("Initial DHT reading failed - check sensor connections")
+            
         self.dht_enabled = True  # Default is enabled
         
         # System configuration
         self.running = False
         self.last_dht_read = 0
         self.dht_read_interval = 10  # seconds between DHT readings
+        self.last_ldr_read = 0
+        self.ldr_read_interval = 10  # seconds between LDR readings
         self.soil_check_timer = None
         self.temperature_timer = None
+        self.ldr_timer = None  # Timer for LDR checks
         self.pump_refresh_timer = None
         self.status_update_timer = None  # Timer for regular status updates
         self.last_pump_refresh = 0
@@ -337,6 +352,82 @@ class SmartIrrigationSystem:
                 # Send immediate status update
                 self.send_status_update()
                 
+            # Process LED control command
+            elif "led_control" in message:
+                state = message["led_control"] == "ON"
+                logger.info(f"Processing LED control command: {'ON' if state else 'OFF'}")
+                
+                # Set the LED state
+                if self.hardware.set_led(state):
+                    logger.info(f"LED turned {'ON' if state else 'OFF'} successfully")
+                    
+                    # Override automatic control if turning off
+                    if not state:
+                        logger.info("Manual LED control: Overriding automatic light-based control")
+                    
+                    # Send immediate status update
+                    self.send_status_update()
+                else:
+                    logger.error(f"Failed to set LED state to {'ON' if state else 'OFF'}")
+            
+            # Process ventilator control command
+            elif "ventilator_control" in message:
+                state = message["ventilator_control"] == "ON"
+                logger.info(f"Processing ventilator control command: {'ON' if state else 'OFF'}")
+                
+                # If we're turning the ventilator on/off manually, switch to manual mode
+                if self.hardware.ventilator_auto_mode:
+                    logger.info("Switching ventilator to MANUAL mode due to direct control command")
+                    self.hardware.set_ventilator_mode(False)  # Set to manual mode
+                    
+                    # Stop cycling if it's active
+                    if self.hardware.ventilator_cycling:
+                        logger.info("Stopping ventilator cycling due to manual control")
+                        self.hardware.stop_ventilator_cycling()
+                
+                # Set the ventilator state
+                if self.hardware.set_ventilator(state):
+                    logger.info(f"Ventilator turned {'ON' if state else 'OFF'} successfully")
+                    
+                    # Update state manager
+                    self.state_manager.update_state(
+                        ventilator_on=state,
+                        ventilator_auto=self.hardware.ventilator_auto_mode,
+                        ventilator_cycling=self.hardware.ventilator_cycling
+                    )
+                    
+                    # Send immediate status update
+                    self.send_status_update()
+                else:
+                    logger.error(f"Failed to set ventilator state to {'ON' if state else 'OFF'}")
+            
+            # Process ventilator mode command
+            elif "ventilator_mode" in message:
+                mode = message["ventilator_mode"].upper()
+                auto_mode = mode == "AUTO" or mode == "AUTOMATIC"
+                logger.info(f"Setting ventilator mode to {'AUTOMATIC' if auto_mode else 'MANUAL'}")
+                
+                if self.hardware.set_ventilator_mode(auto_mode):
+                    logger.info(f"Ventilator mode set to {'AUTOMATIC' if auto_mode else 'MANUAL'} successfully")
+                    
+                    # Update state manager
+                    self.state_manager.update_state(
+                        ventilator_auto=auto_mode,
+                        ventilator_cycling=self.hardware.ventilator_cycling
+                    )
+                    
+                    # If switching to auto mode, immediately check temperature
+                    if auto_mode:
+                        current_temp = self.state_manager.get_state()["temperature"]
+                        if current_temp > 0:  # Only if we have a valid temperature
+                            logger.info(f"Checking temperature ({current_temp}°C) for auto ventilator control")
+                            self.hardware.check_temperature_and_control_ventilator(current_temp)
+                    
+                    # Send immediate status update
+                    self.send_status_update()
+                else:
+                    logger.error(f"Failed to set ventilator mode to {mode}")
+            
             # Acknowledge message
             channel.basic_ack(delivery_tag)
             
@@ -352,6 +443,7 @@ class SmartIrrigationSystem:
         logger.info("Starting sensor monitoring...")
         self.schedule_soil_check()
         self.schedule_temperature_check()
+        self.schedule_ldr_check()  # Start monitoring light levels
         self.schedule_pump_refresh()  # Start the pump refresh cycle
         self.schedule_status_update()  # Start regular status updates
 
@@ -377,6 +469,16 @@ class SmartIrrigationSystem:
                 logger.debug("DHT sensor is disabled - skipping temperature check")
             else:
                 logger.warning(f"Could not schedule temperature check - running: {self.running}, connection available: {self.connection is not None}")
+
+    def schedule_ldr_check(self):
+        """Schedule the next LDR (light) check."""
+        logger.debug("Scheduling next LDR check")
+        if self.running and self.connection:
+            self.ldr_timer = self.connection.ioloop.call_later(
+                self.ldr_read_interval, self.read_ldr)
+            logger.debug("LDR check scheduled")
+        else:
+            logger.warning(f"Could not schedule LDR check - running: {self.running}, connection available: {self.connection is not None}")
 
     def schedule_pump_refresh(self):
         """Schedule the next pump refresh."""
@@ -523,18 +625,66 @@ class SmartIrrigationSystem:
             current_time = datetime.now().strftime("%H:%M:%S")
             
             logger.info(f"[{current_time}] Reading temperature and humidity...")
+            
+            # Add a small delay to avoid GPIO conflicts
+            time.sleep(0.5)
+            
+            # Read from the sensor with error handling
             temp, humidity = self.dht_sensor.read()
             
-            if temp is not None and humidity is not None:
+            if temp is not None and humidity is not None and temp > 0:
                 logger.info(f"[{current_time}] DHT READING: Temperature={temp:.1f}°C, Humidity={humidity:.1f}%")
                 self.state_manager.update_state(
                     temperature=temp,
                     humidity=humidity
                 )
+                
+                # Check temperature and control module on pin 16
+                # Module activates when temperature > 20°C
+                module_changed = self.hardware.check_temperature_and_control_module(temp)
+                if module_changed:
+                    module_state = self.hardware.temp_module_active
+                    logger.info(f"[{current_time}] Temperature module turned {'ON' if module_state else 'OFF'} (temp: {temp:.1f}°C)")
+                
+                # Check temperature and control ventilator if in auto mode
+                ventilator_changed = self.hardware.check_temperature_and_control_ventilator(temp)
+                if ventilator_changed:
+                    ventilator_state = self.hardware.ventilator_active
+                    ventilator_cycling = self.hardware.ventilator_cycling
+                    logger.info(f"[{current_time}] Ventilator control changed based on temperature: active={ventilator_state}, cycling={ventilator_cycling}")
+                    
+                    # Update state manager with ventilator status
+                    self.state_manager.update_state(
+                        ventilator_on=ventilator_state,
+                        ventilator_cycling=ventilator_cycling,
+                        ventilator_auto=self.hardware.ventilator_auto_mode
+                    )
+                
                 # Send status update with new temperature/humidity data
                 self.send_status_update()
             else:
-                logger.warning(f"[{current_time}] DHT READING FAILED: Temperature or humidity is None")
+                # If we got zeros or None, log a more specific warning
+                if temp == 0 and humidity == 0:
+                    logger.warning(f"[{current_time}] DHT READING RETURNED ZEROS: Temperature=0.0°C, Humidity=0.0%")
+                elif temp == 0:
+                    logger.warning(f"[{current_time}] DHT TEMPERATURE IS ZERO: Temperature=0.0°C, Humidity={humidity}%")
+                else:
+                    logger.warning(f"[{current_time}] DHT READING FAILED: Temperature or humidity is None")
+                
+                # Every 5 failures, try to restart the sensor
+                self.dht_sensor.consecutive_failures = getattr(self.dht_sensor, 'consecutive_failures', 0) + 1
+                if self.dht_sensor.consecutive_failures >= 5:
+                    logger.warning(f"[{current_time}] Attempting to restart DHT sensor after {self.dht_sensor.consecutive_failures} failures")
+                    
+                    # Reinitialize the sensor
+                    try:
+                        if hasattr(self.dht_sensor, '_initialize_sensor'):
+                            self.dht_sensor._initialize_sensor()
+                        else:
+                            self.dht_sensor = DHTSensor(board.D20)
+                        self.dht_sensor.consecutive_failures = 0
+                    except Exception as e:
+                        logger.error(f"[{current_time}] Failed to restart DHT sensor: {e}")
                 
         except Exception as e:
             logger.error(f"Error reading temperature: {e}")
@@ -542,6 +692,37 @@ class SmartIrrigationSystem:
             # Schedule next check if DHT is enabled
             if self.dht_enabled:
                 self.schedule_temperature_check()
+
+    def read_ldr(self):
+        """Read light level from LDR sensor and control LED accordingly."""
+        try:
+            # Current time for logging
+            current_time = datetime.now().strftime("%H:%M:%S")
+            
+            logger.info(f"[{current_time}] Reading light level...")
+            
+            # Use the new method that automatically controls the LED based on light detection
+            ldr_value = self.hardware.read_ldr_and_control_led()
+            
+            # Store the LDR value in state (1 = light, 0 = dark)
+            light_detected = ldr_value == 1
+            self.state_manager.update_state(
+                light_detected=light_detected
+            )
+            
+            # Log the light state and LED action with inverted logic
+            # LED is ON when dark, OFF when light detected
+            led_state = not light_detected  # Inverted logic
+            logger.info(f"[{current_time}] LDR READING: {'LIGHT' if light_detected else 'DARK'} - LED is {'OFF' if light_detected else 'ON'}")
+            
+            # Send status update with new light level data
+            self.send_status_update()
+                
+        except Exception as e:
+            logger.error(f"Error reading LDR: {e}")
+        finally:
+            # Schedule next check
+            self.schedule_ldr_check()
 
     def send_status_update(self):
         """Send current system status via RabbitMQ."""
@@ -557,6 +738,12 @@ class SmartIrrigationSystem:
                         "rpi_id": RPI_ID,
                         "timestamp": current_time,
                         "dht_enabled": self.dht_enabled,
+                        "temp_module_active": self.hardware.temp_module_active,  # Include temperature module state
+                        "light_detected": state.get("light_detected", False),  # Include LDR sensor state
+                        "led_active": self.hardware.led_active,  # Include LED state
+                        "ventilator_on": self.hardware.ventilator_active,  # Include ventilator state
+                        "ventilator_auto": self.hardware.ventilator_auto_mode,  # Include ventilator mode
+                        "ventilator_cycling": self.hardware.ventilator_cycling,  # Include ventilator cycling state
                         **state
                     }
                     
@@ -570,7 +757,7 @@ class SmartIrrigationSystem:
                             content_type='application/json'
                         )
                     )
-                    logger.debug(f"Status update sent: soil_moist={state['soil_moist']}, pump_on={state['pump_on']}")
+                    logger.debug(f"Status update sent: soil_moist={state['soil_moist']}, pump_on={state['pump_on']}, temp_module={self.hardware.temp_module_active}, light_detected={state['light_detected']}, led_active={self.hardware.led_active}, ventilator_on={self.hardware.ventilator_active}, ventilator_auto={self.hardware.ventilator_auto_mode}, ventilator_cycling={self.hardware.ventilator_cycling}")
                     self.last_status_update = current_time
             else:
                 logger.warning("Cannot send status update - channel not available")
@@ -668,6 +855,19 @@ API endpoints are available at:
 - http://localhost:8000/irrigation/dht/on       (Enable DHT temperature sensor)
 - http://localhost:8000/irrigation/dht/off      (Disable DHT temperature sensor)
 - http://localhost:8000/irrigation/data         (Get sensor data)
+
+Ventilator Control:
+- http://localhost:8000/irrigation/ventilator/on       (Turn ventilator ON in manual mode)
+- http://localhost:8000/irrigation/ventilator/off      (Turn ventilator OFF in manual mode)
+- http://localhost:8000/irrigation/ventilator/mode/auto    (Enable automatic temperature-based cycling)
+- http://localhost:8000/irrigation/ventilator/mode/manual  (Enable manual control)
+- http://localhost:8000/irrigation/ventilator/status   (Get ventilator status)
+
+LED Control:
+- http://localhost:8000/irrigation/led/on       (Turn LED ON)
+- http://localhost:8000/irrigation/led/off      (Turn LED OFF)
+- http://localhost:8000/irrigation/light        (Get light sensor status)
+
 - http://localhost:8000/docs                    (API documentation)
 """)
         system.run()

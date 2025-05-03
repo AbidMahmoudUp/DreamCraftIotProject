@@ -45,6 +45,8 @@ class SensorData(BaseModel):
     humidity: Optional[float]
     soil_is_dry: Optional[bool]
     pump_active: bool
+    light_detected: Optional[bool]
+    led_active: Optional[bool]
     last_updated: Optional[float]
 
 def send_rabbitmq_message(routing_key: str, message: Dict[str, Any]) -> bool:
@@ -185,6 +187,120 @@ def get_system_status():
         **latest_sensor_data,
         "system_time": datetime.now().isoformat(),
         "rpi_id": RPI_ID
+    }
+
+@app.get("/irrigation/light")
+def get_light_sensor_status():
+    """
+    Get the current light level from the LDR sensor.
+    Note that the LED operates with inverted logic:
+    - LED is ON when it's dark (light_detected = false)
+    - LED is OFF when light is detected (light_detected = true)
+    """
+    if latest_sensor_data["last_updated"] is None:
+        raise HTTPException(status_code=503, detail="Sensor data not yet available")
+        
+    light_detected = latest_sensor_data.get("light_detected", False)
+    led_active = latest_sensor_data.get("led_active", False)
+    
+    return {
+        "light_detected": light_detected,
+        "led_active": led_active,
+        "timestamp": latest_sensor_data.get("last_updated"),
+        "status": "light" if light_detected else "dark",
+        # Add explanation of inverted logic
+        "note": "LED uses inverted logic: ON when dark, OFF when light detected"
+    }
+
+@app.get("/irrigation/led/{state}")
+def control_led(state: str):
+    """Manually control the LED state."""
+    # Only 'on' and 'off' are accepted
+    if state.lower() not in ["on", "off"]:
+        raise HTTPException(status_code=400, detail="State must be 'on' or 'off'")
+        
+    # Send command to control the LED
+    routing_key = f"command.{RPI_ID}"
+    message = {
+        "target_id": RPI_ID,
+        "led_control": state.upper(),
+        "timestamp": time.time()
+    }
+    
+    if send_rabbitmq_message(routing_key, message):
+        return MessageResponse(success=True, message=f"Command to turn LED {state.upper()} has been sent")
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send LED control command")
+
+@app.get("/irrigation/ventilator/on")
+def turn_ventilator_on():
+    """Turn the ventilator on and switch to manual mode."""
+    routing_key = f"command.{RPI_ID}"
+    message = {
+        "target_id": RPI_ID,
+        "ventilator_control": "ON",
+        "timestamp": time.time()
+    }
+    
+    if send_rabbitmq_message(routing_key, message):
+        return MessageResponse(success=True, message="Command to turn ventilator ON has been sent")
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send command to irrigation system")
+
+@app.get("/irrigation/ventilator/off")
+def turn_ventilator_off():
+    """Turn the ventilator off and remain in manual mode."""
+    routing_key = f"command.{RPI_ID}"
+    message = {
+        "target_id": RPI_ID,
+        "ventilator_control": "OFF",
+        "timestamp": time.time()
+    }
+    
+    if send_rabbitmq_message(routing_key, message):
+        return MessageResponse(success=True, message="Command to turn ventilator OFF has been sent")
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send command to irrigation system")
+
+@app.get("/irrigation/ventilator/mode/{mode}")
+def set_ventilator_mode(mode: str):
+    """
+    Set the ventilator control mode.
+    - auto: Automatically control ventilator based on temperature with cycling
+    - manual: Manually control ventilator
+    """
+    if mode.lower() not in ["auto", "automatic", "manual", "man"]:
+        raise HTTPException(status_code=400, detail="Mode must be 'auto' or 'manual'")
+    
+    routing_key = f"command.{RPI_ID}"
+    message = {
+        "target_id": RPI_ID,
+        "ventilator_mode": mode.upper(),
+        "timestamp": time.time()
+    }
+    
+    if send_rabbitmq_message(routing_key, message):
+        mode_display = "AUTOMATIC" if mode.lower() in ["auto", "automatic"] else "MANUAL"
+        return MessageResponse(
+            success=True, 
+            message=f"Command to set ventilator mode to {mode_display} has been sent"
+        )
+    else:
+        raise HTTPException(status_code=500, detail="Failed to send command to irrigation system")
+
+@app.get("/irrigation/ventilator/status")
+def get_ventilator_status():
+    """Get the current ventilator status."""
+    if latest_sensor_data["last_updated"] is None:
+        raise HTTPException(status_code=503, detail="Sensor data not yet available")
+    
+    return {
+        "ventilator_on": latest_sensor_data.get("ventilator_on", False),
+        "ventilator_auto": latest_sensor_data.get("ventilator_auto", True),
+        "ventilator_cycling": latest_sensor_data.get("ventilator_cycling", False),
+        "temperature": latest_sensor_data.get("temperature", 0.0),
+        "timestamp": latest_sensor_data.get("last_updated"),
+        "mode": "automatic" if latest_sensor_data.get("ventilator_auto", True) else "manual"
     }
 
 # This function will be called by the sensor data consumer
