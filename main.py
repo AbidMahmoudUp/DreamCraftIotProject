@@ -632,12 +632,58 @@ class SmartIrrigationSystem:
             # Read from the sensor with error handling
             temp, humidity = self.dht_sensor.read()
             
+            logger.info(f"[{current_time}] DHT READ RESULT: temp={temp}, humidity={humidity}")
+            
             if temp is not None and humidity is not None and temp > 0:
                 logger.info(f"[{current_time}] DHT READING: Temperature={temp:.1f}°C, Humidity={humidity:.1f}%")
+                
+                # Make sure we're storing exact values, not formatted strings
+                temperature_value = float(temp)
+                humidity_value = float(humidity)
+                
+                # Print the exact type and value being stored
+                logger.info(f"CRITICAL: temperature_value={temperature_value} ({type(temperature_value)}), humidity_value={humidity_value} ({type(humidity_value)})")
+                
+                # Ensure humidity is a number, not a string or other type
+                if humidity_value == 0 and humidity > 0:
+                    logger.warning(f"Conversion issue: humidity={humidity} became humidity_value={humidity_value}, forcing correction")
+                    humidity_value = float(humidity)
+                
+                # Update state manager with the values
                 self.state_manager.update_state(
-                    temperature=temp,
-                    humidity=humidity
+                    temperature=temperature_value,
+                    humidity=humidity_value
                 )
+                
+                # Force a direct send of the humidity value via RabbitMQ to ensure it's transmitted
+                try:
+                    direct_message = {
+                        "rpi_id": RPI_ID,
+                        "timestamp": time.time(),
+                        "humidity": humidity_value,
+                        "temperature": temperature_value,
+                        "direct_dht_reading": True
+                    }
+                    
+                    logger.info(f"Sending direct DHT message: {json.dumps(direct_message)}")
+                    
+                    if self.channel:
+                        self.channel.basic_publish(
+                            exchange=EXCHANGE_NAME,
+                            routing_key=f"status.{RPI_ID}",
+                            body=json.dumps(direct_message),
+                            properties=pika.BasicProperties(
+                                delivery_mode=2,
+                                content_type='application/json'
+                            )
+                        )
+                        logger.info(f"Direct DHT message sent: humidity={humidity_value}")
+                except Exception as e:
+                    logger.error(f"Failed to send direct DHT message: {e}")
+                
+                # Verify values were stored properly
+                current_state = self.state_manager.get_state()
+                logger.info(f"[{current_time}] STORED VALUES: Temperature={current_state['temperature']}, Humidity={current_state['humidity']}")
                 
                 # Check temperature and control module on pin 16
                 # Module activates when temperature > 20°C
@@ -731,34 +777,33 @@ class SmartIrrigationSystem:
                 current_time = time.time()
                 # Rate limit status updates
                 if current_time - self.last_status_update >= 1.0:  # Maximum 1 update per second
+                    # Get current state
                     state = self.state_manager.get_state()
                     
-                    # Convert state to message format
-                    message = {
-                        "rpi_id": RPI_ID,
-                        "timestamp": current_time,
-                        "dht_enabled": self.dht_enabled,
-                        "temp_module_active": self.hardware.temp_module_active,  # Include temperature module state
-                        "light_detected": state.get("light_detected", False),  # Include LDR sensor state
-                        "led_active": self.hardware.led_active,  # Include LED state
-                        "ventilator_on": self.hardware.ventilator_active,  # Include ventilator state
-                        "ventilator_auto": self.hardware.ventilator_auto_mode,  # Include ventilator mode
-                        "ventilator_cycling": self.hardware.ventilator_cycling,  # Include ventilator cycling state
-                        **state
-                    }
+                    # Log state data before creating message
+                    logger.info(f"State data for message: temp={state.get('temperature')}, humidity={state.get('humidity')}, soil_moist={state.get('soil_moist')}")
+                    
+                    # Get a properly formatted status message from the state manager
+                    message = self.state_manager.get_status_message()
+                    
+                    # Log the full message for debugging
+                    logger.info(f"Sending status message: {json.dumps(message)}")
                     
                     # Send message to RabbitMQ
-                    self.channel.basic_publish(
-                        exchange=EXCHANGE_NAME,
-                        routing_key=f"status.{RPI_ID}",
-                        body=json.dumps(message),
-                        properties=pika.BasicProperties(
-                            delivery_mode=2,  # Make message persistent
-                            content_type='application/json'
+                    try:
+                        self.channel.basic_publish(
+                            exchange=EXCHANGE_NAME,
+                            routing_key=f"status.{RPI_ID}",
+                            body=json.dumps(message),
+                            properties=pika.BasicProperties(
+                                delivery_mode=2,  # Make message persistent
+                                content_type='application/json'
+                            )
                         )
-                    )
-                    logger.debug(f"Status update sent: soil_moist={state['soil_moist']}, pump_on={state['pump_on']}, temp_module={self.hardware.temp_module_active}, light_detected={state['light_detected']}, led_active={self.hardware.led_active}, ventilator_on={self.hardware.ventilator_active}, ventilator_auto={self.hardware.ventilator_auto_mode}, ventilator_cycling={self.hardware.ventilator_cycling}")
-                    self.last_status_update = current_time
+                        logger.info(f"Status update sent successfully: temperature={message.get('temperature')}, humidity={message.get('humidity')}")
+                        self.last_status_update = current_time
+                    except Exception as e:
+                        logger.error(f"Failed to publish message to RabbitMQ: {e}")
             else:
                 logger.warning("Cannot send status update - channel not available")
                 
@@ -848,27 +893,25 @@ def main():
         print("""
 Smart Irrigation System is running!
 API endpoints are available at:
-- http://localhost:8000/irrigation/pump/on      (Turn pump ON in manual mode)
-- http://localhost:8000/irrigation/pump/off     (Turn pump OFF in manual mode)
-- http://localhost:8000/irrigation/mode/auto    (Switch to automatic mode)
-- http://localhost:8000/irrigation/mode/manual  (Switch to manual mode)
-- http://localhost:8000/irrigation/dht/on       (Enable DHT temperature sensor)
-- http://localhost:8000/irrigation/dht/off      (Disable DHT temperature sensor)
-- http://localhost:8000/irrigation/data         (Get sensor data)
+- http://localhost:8006/irrigation/pump/on      (Turn pump ON in manual mode)
+- http://localhost:8006/irrigation/pump/off     (Turn pump OFF in manual mode)
+- http://localhost:8006/irrigation/mode/auto    (Switch ENTIRE SYSTEM to automatic mode - both irrigation and ventilator)
+- http://localhost:8006/irrigation/mode/manual  (Switch ENTIRE SYSTEM to manual mode - both irrigation and ventilator)
+- http://localhost:8006/irrigation/dht/on       (Enable DHT temperature sensor)
+- http://localhost:8006/irrigation/dht/off      (Disable DHT temperature sensor)
+- http://localhost:8006/irrigation/data         (Get sensor data)
 
 Ventilator Control:
-- http://localhost:8000/irrigation/ventilator/on       (Turn ventilator ON in manual mode)
-- http://localhost:8000/irrigation/ventilator/off      (Turn ventilator OFF in manual mode)
-- http://localhost:8000/irrigation/ventilator/mode/auto    (Enable automatic temperature-based cycling)
-- http://localhost:8000/irrigation/ventilator/mode/manual  (Enable manual control)
-- http://localhost:8000/irrigation/ventilator/status   (Get ventilator status)
+- http://localhost:8006/irrigation/ventilator/on       (Turn ventilator ON in manual mode)
+- http://localhost:8006/irrigation/ventilator/off      (Turn ventilator OFF in manual mode)
+- http://localhost:8006/irrigation/ventilator/status   (Get ventilator status)
 
 LED Control:
-- http://localhost:8000/irrigation/led/on       (Turn LED ON)
-- http://localhost:8000/irrigation/led/off      (Turn LED OFF)
-- http://localhost:8000/irrigation/light        (Get light sensor status)
+- http://localhost:8006/irrigation/led/on       (Turn LED ON)
+- http://localhost:8006/irrigation/led/off      (Turn LED OFF)
+- http://localhost:8006/irrigation/light        (Get light sensor status)
 
-- http://localhost:8000/docs                    (API documentation)
+- http://localhost:8006/docs                    (API documentation)
 """)
         system.run()
     else:

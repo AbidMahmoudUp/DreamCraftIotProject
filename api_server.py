@@ -126,25 +126,47 @@ def turn_pump_off():
 
 @app.get("/irrigation/mode/auto", response_model=MessageResponse)
 def set_auto_mode():
-    """Switch to automatic mode where soil moisture controls the pump."""
+    """Switch entire system to automatic mode where sensors control both irrigation and ventilation."""
     routing_key = f"command.{RPI_ID}"
-    message = {"set_mode": "auto"}
     
-    if send_rabbitmq_message(routing_key, message):
-        return MessageResponse(success=True, message="Command to switch to automatic mode has been sent (soil moisture will control pump)")
+    # First message controls irrigation system mode
+    irrigation_message = {"set_mode": "auto"}
+    success1 = send_rabbitmq_message(routing_key, irrigation_message)
+    
+    # Second message controls ventilator mode
+    ventilator_message = {
+        "target_id": RPI_ID,
+        "ventilator_mode": "AUTO",
+        "timestamp": time.time()
+    }
+    success2 = send_rabbitmq_message(routing_key, ventilator_message)
+    
+    if success1 and success2:
+        return MessageResponse(success=True, message="Command to switch entire system to automatic mode has been sent (sensors will control pump and ventilator)")
     else:
-        raise HTTPException(status_code=500, detail="Failed to send command to irrigation system")
+        raise HTTPException(status_code=500, detail="Failed to send commands to irrigation system")
 
 @app.get("/irrigation/mode/manual", response_model=MessageResponse)
 def set_manual_mode():
-    """Switch to manual mode where the pump is only controlled by API calls, ignoring soil moisture state."""
+    """Switch entire system to manual mode where both pump and ventilator are only controlled by API calls."""
     routing_key = f"command.{RPI_ID}"
-    message = {"set_mode": "manual"}
     
-    if send_rabbitmq_message(routing_key, message):
-        return MessageResponse(success=True, message="Command to switch to manual mode has been sent (soil moisture readings will be ignored)")
+    # First message controls irrigation system mode
+    irrigation_message = {"set_mode": "manual"}
+    success1 = send_rabbitmq_message(routing_key, irrigation_message)
+    
+    # Second message controls ventilator mode
+    ventilator_message = {
+        "target_id": RPI_ID,
+        "ventilator_mode": "MANUAL",
+        "timestamp": time.time()
+    }
+    success2 = send_rabbitmq_message(routing_key, ventilator_message)
+    
+    if success1 and success2:
+        return MessageResponse(success=True, message="Command to switch entire system to manual mode has been sent (all sensors will be ignored)")
     else:
-        raise HTTPException(status_code=500, detail="Failed to send command to irrigation system")
+        raise HTTPException(status_code=500, detail="Failed to send commands to irrigation system")
 
 @app.get("/irrigation/dht/on", response_model=MessageResponse)
 def turn_dht_on():
@@ -265,12 +287,18 @@ def turn_ventilator_off():
 @app.get("/irrigation/ventilator/mode/{mode}")
 def set_ventilator_mode(mode: str):
     """
+    DEPRECATED: Use /irrigation/mode/{mode} instead which controls both irrigation and ventilator.
+    This endpoint will be removed in future versions.
+    
     Set the ventilator control mode.
     - auto: Automatically control ventilator based on temperature with cycling
     - manual: Manually control ventilator
     """
     if mode.lower() not in ["auto", "automatic", "manual", "man"]:
         raise HTTPException(status_code=400, detail="Mode must be 'auto' or 'manual'")
+    
+    # Show deprecation warning
+    logger.warning("Deprecated endpoint used: /irrigation/ventilator/mode/{mode}. Use /irrigation/mode/{mode} instead.")
     
     routing_key = f"command.{RPI_ID}"
     message = {
@@ -283,7 +311,7 @@ def set_ventilator_mode(mode: str):
         mode_display = "AUTOMATIC" if mode.lower() in ["auto", "automatic"] else "MANUAL"
         return MessageResponse(
             success=True, 
-            message=f"Command to set ventilator mode to {mode_display} has been sent"
+            message=f"Command to set ventilator mode to {mode_display} has been sent. NOTE: For future requests, use /irrigation/mode/{mode} to control the entire system."
         )
     else:
         raise HTTPException(status_code=500, detail="Failed to send command to irrigation system")
@@ -300,7 +328,60 @@ def get_ventilator_status():
         "ventilator_cycling": latest_sensor_data.get("ventilator_cycling", False),
         "temperature": latest_sensor_data.get("temperature", 0.0),
         "timestamp": latest_sensor_data.get("last_updated"),
-        "mode": "automatic" if latest_sensor_data.get("ventilator_auto", True) else "manual"
+        "mode": "automatic" if latest_sensor_data.get("ventilator_auto", True) else "manual",
+        "note": "The ventilator mode is now controlled by the unified system mode. Use /irrigation/mode/{auto|manual} to control both irrigation and ventilator modes."
+    }
+
+@app.get("/irrigation/sensors/all")
+def get_all_sensors_data():
+    """
+    Get comprehensive data from all sensors in the system.
+    Specifically focuses on DHT sensor data (temperature and humidity).
+    """
+    if latest_sensor_data["last_updated"] is None:
+        raise HTTPException(status_code=503, detail="Sensor data not yet available")
+    
+    # Debug log the raw sensor data to verify humidity is present
+    humidity_value = latest_sensor_data.get("humidity", 0.0)
+    temperature_value = latest_sensor_data.get("temperature", 0.0)
+    
+    logger.info(f"CRITICAL DEBUG - Raw latest_sensor_data: {latest_sensor_data}")
+    logger.info(f"CRITICAL DEBUG - Direct access humidity value: {humidity_value}")
+    logger.info(f"CRITICAL DEBUG - Direct access temperature value: {temperature_value}")
+    
+    return {
+        # DHT sensor data (highlighted)
+        "dht": {
+            "temperature": temperature_value,
+            "humidity": humidity_value,
+            "enabled": latest_sensor_data.get("dht_enabled", True)
+        },
+        # Soil moisture sensor
+        "soil": {
+            "is_dry": latest_sensor_data.get("soil_is_dry"),
+            "moisture_level": latest_sensor_data.get("soil_moisture_level", 0)
+        },
+        # Actuator states
+        "actuators": {
+            "pump": {
+                "active": latest_sensor_data.get("pump_active", False),
+                "mode": "automatic" if latest_sensor_data.get("automatic_mode", True) else "manual"
+            },
+            "ventilator": {
+                "active": latest_sensor_data.get("ventilator_on", False),
+                "auto_mode": latest_sensor_data.get("ventilator_auto", True),
+                "cycling": latest_sensor_data.get("ventilator_cycling", False)
+            },
+            "led": {
+                "active": latest_sensor_data.get("led_active", False)
+            }
+        },
+        # Light sensor
+        "light": {
+            "detected": latest_sensor_data.get("light_detected", False)
+        },
+        "last_updated": latest_sensor_data.get("last_updated"),
+        "rpi_id": RPI_ID
     }
 
 # This function will be called by the sensor data consumer
@@ -310,4 +391,4 @@ def update_sensor_data(data):
     logger.info(f"Sensor data updated: {latest_sensor_data}")
 
 if __name__ == "__main__":
-    uvicorn.run("api_server:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("api_server:app", host="0.0.0.0", port=8006, reload=True) 

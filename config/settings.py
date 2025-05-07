@@ -12,9 +12,11 @@ RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "password123")
 EXCHANGE_NAME = "irrigation"
 
 # Device Configuration
-RPI_ID = "irrigation_system_1"
-COMMAND_QUEUE = f"irrigation_system.{RPI_ID}.commands"
-STATUS_QUEUE = f"irrigation_system.{RPI_ID}.status"
+# Changed to match the device ID detected by NestJS
+RPI_ID = "simulated-pi1"
+# Changed queue format to match what NestJS is using
+COMMAND_QUEUE = f"rpi.{RPI_ID}.commands"
+STATUS_QUEUE = f"rpi.{RPI_ID}.status"
 
 # GPIO Pin Configuration
 SOIL_SENSOR_PIN = 4

@@ -91,17 +91,83 @@ class SensorDataConsumer:
             message = json.loads(body)
             logger.info(f"Received status update: {message}")
             
-            # Extract sensor data from message
-            sensor_data = {
-                "temperature": message.get("temperature"),
-                "humidity": message.get("humidity"),
-                "soil_is_dry": message.get("soil_moist", False) == False,  # Convert soil_moist to soil_is_dry
-                "pump_active": message.get("pump_on", False),
-                "last_updated": message.get("last_update", time.time())
-            }
+            # Debug the message structure
+            logger.info(f"Message keys: {list(message.keys())}")
+            logger.info(f"CRITICAL - Temperature in message: {message.get('temperature')}, Humidity: {message.get('humidity')}")
             
-            # Update sensor data in API server
-            update_sensor_data(sensor_data)
+            # Additional debug logging for humidity
+            raw_humidity = message.get("humidity")
+            logger.info(f"CRITICAL DEBUG - Raw humidity value from message: {raw_humidity}, type: {type(raw_humidity)}")
+            
+            # Extract sensor data from message with proper field names
+            # The temperature and humidity are directly in the message, not nested
+            try:
+                # Try to safely convert humidity to float with fallback
+                humidity_value = 0.0
+                if raw_humidity is not None:
+                    try:
+                        humidity_value = float(raw_humidity)
+                        logger.info(f"Successfully converted humidity to float: {humidity_value}")
+                    except (ValueError, TypeError):
+                        logger.error(f"Failed to convert humidity value to float: {raw_humidity}")
+                        # If conversion fails, check if it's in a string format
+                        if isinstance(raw_humidity, str):
+                            # Try to extract a numeric value from the string
+                            import re
+                            match = re.search(r'([0-9.]+)', raw_humidity)
+                            if match:
+                                try:
+                                    humidity_value = float(match.group(1))
+                                    logger.info(f"Extracted humidity from string: {humidity_value}")
+                                except ValueError:
+                                    logger.error(f"Failed to convert extracted humidity to float: {match.group(1)}")
+                
+                # Same for temperature
+                temperature_value = 0.0
+                raw_temperature = message.get("temperature", 0.0)
+                if raw_temperature is not None:
+                    try:
+                        temperature_value = float(raw_temperature)
+                    except (ValueError, TypeError):
+                        logger.error(f"Failed to convert temperature value to float: {raw_temperature}")
+                
+                sensor_data = {
+                    "temperature": temperature_value,
+                    "humidity": humidity_value,
+                    "soil_is_dry": not message.get("soil_moist", False),  # Convert soil_moist to soil_is_dry
+                    "pump_active": message.get("pump_on", False) or message.get("pump_active", False),  # Check both field names
+                    "ventilator_on": message.get("ventilator_on", False),
+                    "ventilator_auto": message.get("ventilator_auto", True),
+                    "ventilator_cycling": message.get("ventilator_cycling", False),
+                    "light_detected": message.get("light_detected", False),
+                    "led_active": message.get("led_active", False),
+                    "automatic_mode": message.get("automatic_mode", True),  # Include operation mode
+                    "last_updated": message.get("timestamp", time.time())
+                }
+                
+                logger.info(f"Extracted sensor data: {sensor_data}")
+                
+                # Verify critical values before updating
+                logger.info(f"Verification - temp: {sensor_data['temperature']}, humidity: {sensor_data['humidity']}")
+                
+                # Update sensor data in API server
+                update_sensor_data(sensor_data)
+                
+                # Verify the data was updated in the API server
+                logger.info("Sensor data updated in API server")
+            except Exception as e:
+                logger.error(f"Error processing sensor values: {e}")
+                # Try a simplified approach as fallback
+                sensor_data = {
+                    "temperature": float(message.get("temperature", 0.0)),
+                    "humidity": float(message.get("humidity", 0.0)),
+                    "soil_is_dry": not message.get("soil_moist", False),
+                    "pump_active": message.get("pump_active", False),
+                    "automatic_mode": message.get("automatic_mode", True),
+                    "last_updated": time.time()
+                }
+                logger.info(f"Using fallback sensor data: {sensor_data}")
+                update_sensor_data(sensor_data)
             
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse message as JSON: {e}")
@@ -176,4 +242,4 @@ if __name__ == "__main__":
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        consumer.stop() 
+        consumer.stop()

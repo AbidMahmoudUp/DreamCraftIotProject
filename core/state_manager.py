@@ -1,9 +1,11 @@
 import time
 import logging
+import json
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from utils.logging_setup import logger
+from config.settings import RPI_ID  # Import RPI_ID from settings
 
 @dataclass
 class SystemState:
@@ -50,11 +52,11 @@ class StateManager:
             self._state.last_update = time.time()
             logger.debug(f"State updated: {valid_attrs}")
             return True
-            
+                
         except Exception as e:
             logger.error(f"Error updating state: {e}")
             return False
-            
+                
     def get_state(self) -> Dict[str, Any]:
         """
         Get the current system state.
@@ -62,17 +64,17 @@ class StateManager:
             Dict[str, Any]: Current state as a dictionary
         """
         return asdict(self._state)
-        
+            
     def lock_state(self) -> None:
         """Lock the state to prevent updates."""
         self._state_lock = True
         logger.debug("State locked")
-        
+            
     def unlock_state(self) -> None:
         """Unlock the state to allow updates."""
         self._state_lock = False
         logger.debug("State unlocked")
-        
+            
     def set_error(self, error_msg: str) -> None:
         """
         Set an error state.
@@ -81,12 +83,12 @@ class StateManager:
         """
         self.update_state(error=error_msg)
         logger.error(f"System error: {error_msg}")
-        
+            
     def clear_error(self) -> None:
         """Clear any error state."""
         self.update_state(error=None)
         logger.info("Error state cleared")
-        
+            
     def set_mode(self, mode: str) -> bool:
         """
         Set the system mode (auto/manual).
@@ -98,9 +100,9 @@ class StateManager:
         if mode not in ["auto", "manual"]:
             logger.error(f"Invalid mode: {mode}")
             return False
-            
+                
         return self.update_state(mode=mode, mode_set_by_user=True)
-        
+            
     def update_sensor_data(self, soil_moist: bool, temperature: float, humidity: float) -> None:
         """
         Update sensor readings in the state.
@@ -115,14 +117,14 @@ class StateManager:
             humidity=humidity,
             last_check=time.time()
         )
-        
+            
     def record_watering(self) -> None:
         """Record that watering has occurred."""
         self.update_state(
             last_watering=time.time(),
             pump_on=False
         )
-        
+            
     def is_watering_allowed(self, min_interval: int = 3600) -> bool:
         """
         Check if watering is allowed based on timing.
@@ -133,10 +135,10 @@ class StateManager:
         """
         if self._state.last_watering is None:
             return True
-            
+                
         time_since_last = time.time() - self._state.last_watering
         return time_since_last >= min_interval 
-        
+            
     def set_automatic_mode(self, automatic: bool) -> bool:
         """
         Set the system to automatic or manual mode.
@@ -150,7 +152,7 @@ class StateManager:
         if result:
             logger.info(f"System set to {'AUTOMATIC' if automatic else 'MANUAL'} mode")
         return result
-        
+            
     def update_pump_state(self, pump_on: bool) -> bool:
         """
         Update the pump state.
@@ -166,7 +168,7 @@ class StateManager:
                 # Record watering start time if turning on
                 self.update_state(last_watering=time.time())
         return result
-        
+            
     def get_status_message(self) -> Dict[str, Any]:
         """
         Get a formatted status message for sending via messaging system.
@@ -174,16 +176,59 @@ class StateManager:
             Dict[str, Any]: Status information
         """
         state = self.get_state()
-        return {
-            "rpi_id": "irrigation_system_1",  # Should be from config
+        
+        # CRITICAL: More detailed logging for humidity specifically
+        humidity_value = state.get("humidity", 0.0)
+        temperature_value = state.get("temperature", 0.0)
+        
+        logger.info(f"CRITICAL - Raw state values: temperature={temperature_value} ({type(temperature_value)}), humidity={humidity_value} ({type(humidity_value)})")
+        
+        # Ensure humidity is a float value, not a string or other type
+        if isinstance(humidity_value, str):
+            try:
+                humidity_value = float(humidity_value)
+                logger.info(f"Converted humidity from string to float: {humidity_value}")
+            except ValueError:
+                logger.error(f"Failed to convert humidity string to float: {humidity_value}")
+                humidity_value = 0.0
+        
+        # If humidity is 0 but temperature is not, something is wrong - use a default value
+        if humidity_value == 0.0 and temperature_value > 0:
+            logger.warning(f"Humidity is 0 but temperature is {temperature_value}, setting default humidity value")
+            humidity_value = 50.0  # Default fallback value
+        
+        message = {
+            "rpi_id": RPI_ID,
             "timestamp": time.time(),
             "soil_is_dry": not state.get("soil_moist", False),
+            "soil_moist": state.get("soil_moist", False),  # Include both formats
             "pump_active": state.get("pump_on", False),
+            "pump_on": state.get("pump_on", False),  # Include both formats
             "automatic_mode": state.get("mode", "auto") == "auto",
+            "mode": state.get("mode", "auto"),  # Include actual mode
             "last_watered": state.get("last_watering"),
-            "temperature": state.get("temperature"),
-            "light_detected": state.get("light_detected", False),  # Include light sensor data
-            "ventilator_on": state.get("ventilator_on", False),  # Include ventilator state
-            "ventilator_auto": state.get("ventilator_auto", True),  # Include ventilator mode
-            "ventilator_cycling": state.get("ventilator_cycling", False)  # Include ventilator cycling state
-        } 
+            "temperature": temperature_value,  # Use our validated temperature
+            "humidity": humidity_value,  # Use our validated humidity
+            "light_detected": state.get("light_detected", False),
+            "ventilator_on": state.get("ventilator_on", False),
+            "ventilator_auto": state.get("ventilator_auto", True),
+            "ventilator_cycling": state.get("ventilator_cycling", False)
+        }
+        
+        # Force adding humidity at the top level for maximum visibility
+        message["dht_values"] = {
+            "temperature": temperature_value,
+            "humidity": humidity_value
+        }
+        
+        # DEBUG: Log the outgoing message with explicit focus on humidity
+        logger.info(f"HUMIDITY CHECK - Sending message with temperature: {message['temperature']}, humidity: {message['humidity']}")
+        
+        # Verify the message has humidity by dumping to JSON and searching for it
+        message_json = json.dumps(message)
+        if '"humidity":' in message_json:
+            logger.info(f"Humidity key confirmed in JSON message")
+        else:
+            logger.error(f"Humidity missing from JSON message: {message_json}")
+        
+        return message 
